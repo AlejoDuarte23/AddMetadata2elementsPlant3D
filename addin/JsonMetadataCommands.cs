@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.IO;
@@ -15,13 +15,14 @@ using Autodesk.ProcessPower.DataLinks;
 using Autodesk.ProcessPower.ProjectManager;
 using Autodesk.ProcessPower.PlantInstance;
 
+// Alias to avoid confusion with System.Exception
+using AcRxException = Autodesk.AutoCAD.Runtime.Exception;
+
 namespace Plant3dProps
 {
     public class JsonMetadataCommands
     {
-        private const string DefaultJsonPath =
-            @"C:\Users\aleja\Documents\add-metadata-to-elements-plant3d\sample\metadata.json";
-
+        // ---- JSON models ----
         public sealed class MetadataFile
         {
             [JsonPropertyName("version")]
@@ -62,53 +63,15 @@ namespace Plant3dProps
             }
         }
 
-        [CommandMethod("P3D_APPLY_JSON_METADATA", CommandFlags.Modal)]
-        public static void ApplyJsonMetadata()
-        {
-            Document doc = Application.DocumentManager.MdiActiveDocument;
-            Editor ed = doc.Editor;
-
-            var pPath = new PromptStringOptions("\nJSON file path")
-            {
-                AllowSpaces = true,
-                DefaultValue = DefaultJsonPath,
-                UseDefaultValue = true
-            };
-            var rPath = ed.GetString(pPath);
-            if (rPath.Status != PromptStatus.OK) return;
-
-            string jsonPath = (rPath.StringResult ?? "").Trim();
-            if (!TryLoadMetadata(jsonPath, ed, out MetadataFile metadata))
-                return;
-
-            Project prj;
-            try
-            {
-                // For interactive command, "current document" is correct.
-                prj = PnPProjectUtils.GetProjectPartForCurrentDocument();
-            }
-            catch (System.Exception ex)
-            {
-                SafeWriteMessage(ed, $"\nNo active Plant project/document: {ex.Message}");
-                return;
-            }
-
-            using (doc.LockDocument())
-            {
-                var (totalMatched, totalUpdated) = ApplyMetadataToDocument(metadata, doc, prj, ed);
-                SafeWriteMessage(ed, $"\nMatched: {totalMatched}, Updated: {totalUpdated}");
-            }
-
-            if (ShouldSaveChanges())
-            {
-                TrySaveDocument(doc, ed);
-            }
-
-            SafeWriteMessage(ed, "\nIf Data Manager is open, click Refresh to see updated values.");
-        }
-
+        // Requires:
+        //  PLANT_PROJECT_XML = full path to Project.xml
+        //  PLANT_JSON_IN     = full path to metadata.json
+        // Optional:
+        //  PLANT_SAVE_CHANGES= 0/false to disable saving
+        //  PLANT_LOG_JSON    = path to write summary json
+        //  PLANT_LOG_PATH    = path to append jsonl
         [CommandMethod("P3D_APPLY_JSON_METADATA_XML", CommandFlags.Session)]
-        public static void ApplyJsonMetadataFromProjectXml()
+        public static void ApplyJsonMetadataBatch()
         {
             var docMan = Application.DocumentManager;
             var ed = docMan.MdiActiveDocument?.Editor;
@@ -136,10 +99,20 @@ namespace Plant3dProps
             PlantProject? plantPrj = null;
             var logs = new List<ApplyLogEntry>();
             JsonlLogger? logger = null;
+
             try
             {
                 if (!string.IsNullOrWhiteSpace(logPath))
                     logger = new JsonlLogger(logPath);
+
+                var saveChanges = ShouldSaveChanges();
+
+                logger?.Write(new RunStartLog
+                {
+                    projectXml = projectXml,
+                    jsonIn = jsonIn,
+                    saveChanges = saveChanges
+                });
 
                 plantPrj = PlantProject.LoadProject(projectXml, true, null, null);
 
@@ -149,14 +122,6 @@ namespace Plant3dProps
                     SafeWriteMessage(ed, "\nNo project drawings found.");
                     return;
                 }
-
-                var saveChanges = ShouldSaveChanges();
-                logger?.Write(new RunStartLog
-                {
-                    projectXml = projectXml,
-                    jsonIn = jsonIn,
-                    saveChanges = saveChanges
-                });
 
                 int drawingsTried = 0;
                 int drawingsUpdated = 0;
@@ -186,58 +151,87 @@ namespace Plant3dProps
                     }
 
                     Document? doc = null;
+
                     try
                     {
-                        doc = docMan.Open(resolvedPath, false);
+                        doc = docMan.Open(resolvedPath, false); // false = read/write
 
+                        int matched;
+                        int updated;
+
+                        // Apply metadata while locked
                         using (doc.LockDocument())
                         {
-                            var (matched, updated) =
+                            (matched, updated) =
                                 ApplyMetadataToDocument(metadata, doc, d.ProjectPart, doc.Editor);
-
-                            SafeWriteMessage(ed,
-                                $"\nUpdated '{Path.GetFileName(resolvedPath)}' matched={matched}, updated={updated}");
-
-                            logs.Add(ApplyLogEntry.UpdatedEntry(
-                                resolvedPath,
-                                GetOutputPathSameFolder(resolvedPath),
-                                matched,
-                                updated,
-                                resolutionNote));
-
-                            totalMatched += matched;
-                            totalUpdated += updated;
-                            if (updated > 0) drawingsUpdated++;
-
-                            logger?.Write(new DrawingLog
-                            {
-                                drawing = resolvedPath,
-                                matched = matched,
-                                updated = updated
-                            });
                         }
+
+                        SafeWriteMessage(ed,
+                            $"\nProcessed '{Path.GetFileName(resolvedPath)}' matched={matched}, updated={updated}");
+
+                        totalMatched += matched;
+                        totalUpdated += updated;
+                        if (updated > 0) drawingsUpdated++;
 
                         if (saveChanges)
                         {
-                            var outputPath = GetOutputPathSameFolder(resolvedPath);
-                            doc.Database.SaveAs(outputPath, doc.Database.OriginalFileVersion);
-                            doc.CloseAndDiscard();
+                            string outputPath = GetOutputPathSameFolder(resolvedPath);
+
+                            // Save original using document-level save + close,
+                            // then create output copy from disk.
+                            SaveOriginalThenCopyOutputAndClose(doc, resolvedPath, outputPath, ed);
+
+                            // doc is now CLOSED; prevent later accidental use
+                            doc = null;
+
+                            logs.Add(ApplyLogEntry.UpdatedEntry(
+                                resolvedPath,
+                                outputPath,
+                                matched,
+                                updated,
+                                resolutionNote));
                         }
                         else
                         {
+                            logs.Add(new ApplyLogEntry(
+                                resolvedPath,
+                                "processed_no_save",
+                                matched,
+                                updated,
+                                null,
+                                resolutionNote,
+                                null));
+
                             doc.CloseAndDiscard();
+                            doc = null;
                         }
+
+                        logger?.Write(new DrawingLog
+                        {
+                            drawing = resolvedPath,
+                            matched = matched,
+                            updated = updated
+                        });
                     }
                     catch (System.Exception ex)
                     {
-                        try { doc?.CloseAndDiscard(); } catch { }
+                        try
+                        {
+                            doc?.CloseAndDiscard();
+                        }
+                        catch
+                        {
+                            // ignore
+                        }
+
                         logs.Add(ApplyLogEntry.Failed(resolvedPath, ex.Message));
                         logger?.Write(new DrawingLog
                         {
                             drawing = resolvedPath,
                             error = ex.ToString()
                         });
-                        SafeWriteMessage(ed, $"\nError updating '{resolvedPath}': {ex.Message}");
+
+                        SafeWriteMessage(ed, $"\nError processing '{resolvedPath}': {ex.Message}");
                     }
                 }
 
@@ -248,6 +242,10 @@ namespace Plant3dProps
                     totalMatched = totalMatched,
                     totalUpdated = totalUpdated
                 });
+
+                SafeWriteMessage(ed,
+                    $"\nDone. Drawings tried={drawingsTried}, drawings updated={drawingsUpdated}, total matched={totalMatched}, total updated={totalUpdated}");
+                SafeWriteMessage(ed, "\nIf Data Manager is open, click Refresh to see updated values.");
             }
             catch (System.Exception ex)
             {
@@ -261,13 +259,76 @@ namespace Plant3dProps
             }
         }
 
+        private static void SaveOriginalThenCopyOutputAndClose(
+            Document doc,
+            string originalPath,
+            string outputPath,
+            Editor? ed)
+        {
+            // Basic checks (help diagnose save failures)
+            if (doc.IsReadOnly)
+                throw new InvalidOperationException("Document is read-only (doc.IsReadOnly=true).");
+
+            var fi = new FileInfo(originalPath);
+            if (fi.Exists && fi.IsReadOnly)
+                throw new InvalidOperationException("Original DWG is marked read-only on disk.");
+
+            // 1) Save original drawing in place using Document-level save, then close it.
+            doc.CloseAndSave(originalPath);
+
+            // 2) Create output.dwg by copying the saved original from disk.
+            CopyFileWithRetries(originalPath, outputPath, overwrite: true);
+
+            SafeWriteMessage(ed, $"\nSaved original: {originalPath}");
+            SafeWriteMessage(ed, $"\nSaved copy:     {outputPath}");
+        }
+
+        private static void CopyFileWithRetries(string source, string dest, bool overwrite)
+        {
+            var dir = Path.GetDirectoryName(dest);
+            if (!string.IsNullOrWhiteSpace(dir))
+                Directory.CreateDirectory(dir);
+
+            // Ensure destination is not read-only
+            if (File.Exists(dest))
+            {
+                try
+                {
+                    var fo = new FileInfo(dest);
+                    if (fo.IsReadOnly) fo.IsReadOnly = false;
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            System.Exception? last = null;
+
+            for (int i = 0; i < 10; i++)
+            {
+                try
+                {
+                    File.Copy(source, dest, overwrite);
+                    return;
+                }
+                catch (System.Exception ex)
+                {
+                    last = ex;
+                    System.Threading.Thread.Sleep(200);
+                }
+            }
+
+            throw new IOException($"Failed to create output copy after retries: {dest}", last);
+        }
+
         private static bool TryLoadMetadata(string jsonPath, Editor? ed, out MetadataFile metadata)
         {
             metadata = new MetadataFile();
 
             if (!File.Exists(jsonPath))
             {
-                ed?.WriteMessage($"\nFile not found: {jsonPath}");
+                SafeWriteMessage(ed, $"\nFile not found: {jsonPath}");
                 return false;
             }
 
@@ -286,13 +347,13 @@ namespace Plant3dProps
             }
             catch (System.Exception ex)
             {
-                ed?.WriteMessage($"\nFailed to read/parse JSON: {ex.Message}");
+                SafeWriteMessage(ed, $"\nFailed to read/parse JSON: {ex.Message}");
                 return false;
             }
 
             if (metadata.Items.Count == 0)
             {
-                ed?.WriteMessage("\nNo items in JSON.");
+                SafeWriteMessage(ed, "\nNo items in JSON.");
                 return false;
             }
 
@@ -412,44 +473,18 @@ namespace Plant3dProps
             return (totalMatched, totalUpdated);
         }
 
-        private static void TrySaveDocument(Document doc, Editor? ed)
-        {
-            try
-            {
-                var outPath = GetOutputPathSameFolder(doc);
-                doc.Database.SaveAs(outPath, doc.Database.OriginalFileVersion);
-                SafeWriteMessage(ed, $"\nSaved copy: {outPath}");
-                doc.CloseAndDiscard();
-            }
-            catch (System.Exception ex)
-            {
-                SafeWriteMessage(ed, $"\nWARNING: Could not save drawing automatically: {ex.Message}");
-                SafeWriteMessage(ed, "\nRun QSAVE manually to persist to disk.");
-            }
-        }
-
         private static void SafeWriteMessage(Editor? ed, string message)
         {
             if (ed is null) return;
+
             try
             {
                 ed.WriteMessage(message);
             }
-            catch (Autodesk.AutoCAD.Runtime.Exception)
+            catch (AcRxException)
             {
                 // Ignore messages when the editor is not in a valid command context.
             }
-        }
-
-        private static string GetOutputPathSameFolder(Document doc)
-        {
-            // If doc.Name is a full path, put output.dwg next to it.
-            // If it's an unsaved drawing (e.g., "Drawing1.dwg"), fall back to Desktop.
-            string dir = Path.GetDirectoryName(doc.Name) ?? "";
-            if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
-                dir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-
-            return Path.Combine(dir, "output.dwg");
         }
 
         private static bool ShouldSaveChanges()
@@ -498,6 +533,7 @@ namespace Plant3dProps
             if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
                 dir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
 
+            // Always "output.dwg" in the same folder (overwrites).
             return Path.Combine(dir, "output.dwg");
         }
 
