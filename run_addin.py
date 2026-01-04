@@ -81,12 +81,17 @@ def default_json() -> Path:
 
 
 def main() -> int:
-    project_xml = os.environ.get(
-        "PLANT_PROJECT_XML",
-        r"C:\Users\aleja\Downloads\NIRAS P3D Demo Project\P3D-FBUK Example Project\Project.xml",
+    # Replace this default with your own Project.xml path if needed.
+    project_xml = os.path.expanduser(
+        os.environ.get(
+            "PLANT_PROJECT_XML",
+            r"~\Downloads\NIRAS P3D Demo Project\P3D-FBUK Example Project\Project.xml",
+        )
     )
-    json_in = os.environ.get("PLANT_JSON_IN", str(default_json()))
-    plugin_dll = os.environ.get("PLANT_PLUGIN_DLL", str(default_plugin_dll()))
+    json_in = os.path.expanduser(os.environ.get("PLANT_JSON_IN", str(default_json())))
+    plugin_dll = os.path.expanduser(
+        os.environ.get("PLANT_PLUGIN_DLL", str(default_plugin_dll()))
+    )
 
     if not project_xml:
         raise SystemExit("PLANT_PROJECT_XML is required.")
